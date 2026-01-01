@@ -76,6 +76,68 @@ router.get("/", async (req, res) => {
   }
 });
 
+// Get available tasks for workers
+router.get("/available", async (req, res) => {
+  try {
+    const db = getDb();
+    const now = new Date();
+
+    // Find tasks where:
+    // - status is active
+    // - quantity > completedCount (workers still needed)
+    // - deadline hasn't passed (or no deadline)
+    const tasks = await db.collection("tasks").aggregate([
+      {
+        $match: {
+          status: "active",
+          $expr: { $gt: ["$quantity", "$completedCount"] },
+          $or: [
+            { deadline: null },
+            { deadline: { $gt: now } }
+          ]
+        }
+      },
+      { $sort: { createdAt: -1 } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "buyer",
+          foreignField: "_id",
+          as: "buyerInfo"
+        }
+      },
+      {
+        $addFields: {
+          buyer: {
+            $let: {
+              vars: { buyerData: { $arrayElemAt: ["$buyerInfo", 0] } },
+              in: {
+                _id: "$$buyerData._id",
+                name: "$$buyerData.name",
+                email: "$$buyerData.email",
+                image: "$$buyerData.image"
+              }
+            }
+          },
+          requiredWorkers: { $subtract: ["$quantity", "$completedCount"] }
+        }
+      },
+      { $project: { buyerInfo: 0 } }
+    ]).toArray();
+
+    res.json({
+      success: true,
+      count: tasks.length,
+      tasks,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch available tasks. Please try again.",
+    });
+  }
+});
+
 // Get single task
 router.get("/:id", async (req, res) => {
   try {

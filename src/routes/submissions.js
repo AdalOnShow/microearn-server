@@ -23,7 +23,6 @@ router.get("/", protect, async (req, res) => {
     }
 
     if (task) {
-      // Validate ObjectId format
       if (!ObjectId.isValid(task)) {
         return res.status(400).json({
           success: false,
@@ -36,7 +35,7 @@ router.get("/", protect, async (req, res) => {
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Get submissions with task and worker info
+    // Get submissions with task, worker, and buyer info
     const submissions = await db.collection("submissions").aggregate([
       { $match: query },
       { $sort: { submittedAt: -1 } },
@@ -56,6 +55,14 @@ router.get("/", protect, async (req, res) => {
           localField: "worker",
           foreignField: "_id",
           as: "workerInfo"
+        }
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "taskInfo.buyer",
+          foreignField: "_id",
+          as: "buyerInfo"
         }
       },
       {
@@ -80,10 +87,20 @@ router.get("/", protect, async (req, res) => {
                 image: "$$workerData.image"
               }
             }
+          },
+          buyer: {
+            $let: {
+              vars: { buyerData: { $arrayElemAt: ["$buyerInfo", 0] } },
+              in: {
+                _id: "$$buyerData._id",
+                name: "$$buyerData.name",
+                email: "$$buyerData.email"
+              }
+            }
           }
         }
       },
-      { $project: { taskInfo: 0, workerInfo: 0 } }
+      { $project: { taskInfo: 0, workerInfo: 0, buyerInfo: 0 } }
     ]).toArray();
 
     const total = await db.collection("submissions").countDocuments(query);
@@ -103,12 +120,12 @@ router.get("/", protect, async (req, res) => {
   }
 });
 
+
 // Create submission (Worker only)
 router.post("/", protect, restrictTo("Worker"), async (req, res) => {
   try {
     const { taskId, submissionDetails } = req.body;
 
-    // Validate required fields
     if (!taskId || !submissionDetails) {
       return res.status(400).json({
         success: false,
@@ -116,7 +133,6 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       });
     }
 
-    // Validate ObjectId format
     if (!ObjectId.isValid(taskId)) {
       return res.status(400).json({
         success: false,
@@ -151,7 +167,14 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       });
     }
 
-    // Check for existing submission
+    // Check if deadline has passed
+    if (task.deadline && new Date(task.deadline) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: "Task deadline has passed",
+      });
+    }
+
     const existingSubmission = await db.collection("submissions").findOne({
       task: new ObjectId(taskId),
       worker: req.user._id,
@@ -194,7 +217,6 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
   try {
     const { status, feedback } = req.body;
 
-    // Validate ObjectId format
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({
         success: false,
@@ -202,7 +224,6 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
       });
     }
 
-    // Validate status
     if (!status || !["approved", "rejected"].includes(status)) {
       return res.status(400).json({
         success: false,
@@ -212,7 +233,6 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
 
     const db = getDb();
     
-    // Use findOne to get current state before any updates
     const submission = await db.collection("submissions").findOne({ 
       _id: new ObjectId(req.params.id) 
     });
@@ -224,7 +244,6 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
       });
     }
 
-    // SAFETY CHECK: Prevent double approval/rejection
     if (submission.status !== "pending") {
       return res.status(400).json({
         success: false,
@@ -243,11 +262,10 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
       });
     }
 
-    // SAFETY CHECK: Validate ownership - buyer can only review their own tasks
     if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
       return res.status(403).json({
         success: false,
-        message: "Not authorized to review this submission. You can only review submissions for your own tasks.",
+        message: "Not authorized to review this submission.",
       });
     }
 
@@ -258,33 +276,28 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
     };
 
     if (status === "approved") {
-      // Pay the worker
       updates.rewardPaid = task.reward;
       
-      // Update worker coins
       await db.collection("users").updateOne(
         { _id: submission.worker },
         { $inc: { coin: task.reward } }
       );
 
-      // Update task completed count
       await db.collection("tasks").updateOne(
         { _id: task._id },
         { $inc: { completedCount: 1 } }
       );
     } else if (status === "rejected") {
-      // Increase quantity by 1 to allow another worker to take the slot
       await db.collection("tasks").updateOne(
         { _id: task._id },
         { $inc: { quantity: 1 } }
       );
     }
 
-    // Use findOneAndUpdate with condition to prevent race conditions
     const result = await db.collection("submissions").findOneAndUpdate(
       { 
         _id: new ObjectId(req.params.id),
-        status: "pending" // Only update if still pending
+        status: "pending"
       },
       { $set: updates },
       { returnDocument: "after" }

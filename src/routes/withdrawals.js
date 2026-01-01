@@ -74,34 +74,101 @@ router.post("/", protect, async (req, res) => {
   try {
     const { amount, paymentMethod, paymentDetails } = req.body;
 
-    if (amount < 100) {
+    // SAFETY CHECK: Validate input types
+    if (!amount || !paymentMethod || !paymentDetails) {
       return res.status(400).json({
         success: false,
-        message: "Minimum withdrawal is 100 coins",
+        message: "All fields are required",
       });
     }
 
-    if (req.user.coin < amount) {
+    // SAFETY CHECK: Validate numeric input
+    const withdrawalAmount = parseInt(amount);
+    if (isNaN(withdrawalAmount) || withdrawalAmount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid withdrawal amount",
+      });
+    }
+
+    // SAFETY CHECK: Minimum withdrawal validation
+    if (withdrawalAmount < 200) {
+      return res.status(400).json({
+        success: false,
+        message: "Minimum withdrawal is 200 coins (10 dollars)",
+      });
+    }
+
+    // SAFETY CHECK: Get fresh user data to prevent race conditions
+    const db = getDb();
+    const currentUser = await db.collection("users").findOne({ _id: req.user._id });
+    
+    if (!currentUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // SAFETY CHECK: Validate sufficient balance
+    if (currentUser.coin < withdrawalAmount) {
       return res.status(400).json({
         success: false,
         message: "Insufficient coins",
+        availableCoins: currentUser.coin,
+        requestedCoins: withdrawalAmount,
       });
     }
 
-    const db = getDb();
-
-    // Deduct coins immediately
-    await db.collection("users").updateOne(
-      { _id: req.user._id },
-      { $inc: { coin: -amount } }
-    );
-
-    const newWithdrawal = {
+    // SAFETY CHECK: Prevent multiple pending withdrawals
+    const existingPendingWithdrawal = await db.collection("withdrawals").findOne({
       user: req.user._id,
-      amount,
-      paymentMethod,
-      paymentDetails,
+      status: "pending"
+    });
+
+    if (existingPendingWithdrawal) {
+      return res.status(400).json({
+        success: false,
+        message: "You already have a pending withdrawal request. Please wait for admin approval.",
+        pendingWithdrawal: {
+          amount: existingPendingWithdrawal.withdrawal_coin || existingPendingWithdrawal.amount,
+          requestedAt: existingPendingWithdrawal.withdraw_date || existingPendingWithdrawal.requestedAt
+        }
+      });
+    }
+
+    // SAFETY CHECK: Validate payment method
+    const validPaymentMethods = ["stripe", "bkash", "rocket", "nagad"];
+    if (!validPaymentMethods.includes(paymentMethod.toLowerCase())) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment method",
+      });
+    }
+
+    // SAFETY CHECK: Validate account number format
+    if (!paymentDetails.trim() || paymentDetails.trim().length < 3) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid account number",
+      });
+    }
+
+    // DO NOT deduct coins immediately - wait for admin approval
+    const newWithdrawal = {
+      worker_email: currentUser.email,
+      worker_name: currentUser.name,
+      withdrawal_coin: withdrawalAmount,
+      withdrawal_amount: (withdrawalAmount / 20).toFixed(2), // Convert to USD
+      payment_system: paymentMethod.toLowerCase(),
+      account_number: paymentDetails.trim(),
+      withdraw_date: new Date(),
       status: "pending",
+      // Keep original fields for compatibility
+      user: req.user._id,
+      amount: withdrawalAmount,
+      paymentMethod: paymentMethod.toLowerCase(),
+      paymentDetails: paymentDetails.trim(),
       adminNote: "",
       requestedAt: new Date(),
       processedAt: null,
@@ -112,11 +179,13 @@ router.post("/", protect, async (req, res) => {
     res.status(201).json({
       success: true,
       withdrawal: { ...newWithdrawal, _id: result.insertedId },
+      message: "Withdrawal request submitted successfully. Awaiting admin approval."
     });
   } catch (error) {
+    console.error("Withdrawal creation error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to process withdrawal request. Please try again.",
     });
   }
 });
@@ -145,8 +214,15 @@ router.patch("/:id", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
-    // If rejected, refund coins
-    if (status === "rejected" && withdrawal.status === "pending") {
+    // Handle coin deduction based on status
+    if (status === "approved" && withdrawal.status === "pending") {
+      // Deduct coins when approved (not when initially requested)
+      await db.collection("users").updateOne(
+        { _id: withdrawal.user },
+        { $inc: { coin: -withdrawal.amount } }
+      );
+    } else if (status === "rejected" && withdrawal.status === "approved") {
+      // Refund coins if previously approved withdrawal is now rejected
       await db.collection("users").updateOne(
         { _id: withdrawal.user },
         { $inc: { coin: withdrawal.amount } }

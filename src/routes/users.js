@@ -27,6 +27,55 @@ router.get("/", protect, restrictTo("Admin"), async (req, res) => {
   }
 });
 
+// Get worker stats - SAFETY: Only returns stats for the authenticated worker
+router.get(
+  "/worker/stats",
+  protect,
+  restrictTo("Worker", "Admin"),
+  async (req, res) => {
+    try {
+      const db = getDb();
+      // SAFETY CHECK: Always use authenticated user's ID
+      const workerId = req.user._id;
+
+      // Total submissions count
+      const totalSubmissions = await db
+        .collection("submissions")
+        .countDocuments({ worker: workerId });
+
+      // Pending submissions count
+      const pendingSubmissions = await db
+        .collection("submissions")
+        .countDocuments({ worker: workerId, status: "pending" });
+
+      // Total earnings (sum of rewardPaid where status = approved)
+      const earningsResult = await db
+        .collection("submissions")
+        .aggregate([
+          { $match: { worker: workerId, status: "approved" } },
+          { $group: { _id: null, total: { $sum: "$rewardPaid" } } },
+        ])
+        .toArray();
+
+      const totalEarnings = earningsResult[0]?.total || 0;
+
+      res.json({
+        success: true,
+        stats: {
+          totalSubmissions,
+          pendingSubmissions,
+          totalEarnings,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch stats. Please try again.",
+      });
+    }
+  }
+);
+
 // Get buyer stats - SAFETY: Only returns stats for the authenticated buyer
 router.get(
   "/buyer/stats",
