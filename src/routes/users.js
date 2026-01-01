@@ -27,6 +27,58 @@ router.get("/", protect, restrictTo("Admin"), async (req, res) => {
   }
 });
 
+// Get admin stats
+router.get("/admin/stats", protect, restrictTo("Admin"), async (req, res) => {
+  try {
+    const db = getDb();
+
+    // Get total users by role
+    const userStats = await db.collection("users").aggregate([
+      {
+        $group: {
+          _id: "$role",
+          count: { $sum: 1 },
+          totalCoins: { $sum: "$coin" }
+        }
+      }
+    ]).toArray();
+
+    // Calculate totals
+    let totalWorkers = 0;
+    let totalBuyers = 0;
+    let totalCoins = 0;
+
+    userStats.forEach(stat => {
+      if (stat._id === "Worker") totalWorkers = stat.count;
+      if (stat._id === "Buyer") totalBuyers = stat.count;
+      totalCoins += stat.totalCoins || 0;
+    });
+
+    // Get total payments (sum of all approved withdrawals)
+    const paymentsResult = await db.collection("withdrawals").aggregate([
+      { $match: { status: "approved" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } }
+    ]).toArray();
+
+    const totalPayments = paymentsResult[0]?.total || 0;
+
+    res.json({
+      success: true,
+      stats: {
+        totalWorkers,
+        totalBuyers,
+        totalCoins,
+        totalPayments
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch admin stats. Please try again.",
+    });
+  }
+});
+
 // Get worker stats - SAFETY: Only returns stats for the authenticated worker
 router.get(
   "/worker/stats",
@@ -256,6 +308,20 @@ router.patch("/:id/role", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
+    const db = getDb();
+    
+    // Get current user data
+    const currentUser = await db.collection("users").findOne({
+      _id: new ObjectId(req.params.id)
+    });
+
+    if (!currentUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
     // SAFETY CHECK: Prevent admin from changing their own role
     if (req.params.id === req.user._id.toString()) {
       return res.status(400).json({
@@ -264,7 +330,17 @@ router.patch("/:id/role", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
-    const db = getDb();
+    // SAFETY CHECK: Prevent demoting the last admin
+    if (currentUser.role === "Admin" && role !== "Admin") {
+      const adminCount = await db.collection("users").countDocuments({ role: "Admin" });
+      if (adminCount <= 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot demote the last admin user",
+        });
+      }
+    }
+
     const result = await db
       .collection("users")
       .findOneAndUpdate(
@@ -303,6 +379,20 @@ router.delete("/:id", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
+    const db = getDb();
+    
+    // Get user to delete
+    const userToDelete = await db.collection("users").findOne({
+      _id: new ObjectId(req.params.id)
+    });
+
+    if (!userToDelete) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
     // SAFETY CHECK: Prevent admin from deleting themselves
     if (req.params.id === req.user._id.toString()) {
       return res.status(400).json({
@@ -311,7 +401,17 @@ router.delete("/:id", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
-    const db = getDb();
+    // SAFETY CHECK: Prevent deleting the last admin
+    if (userToDelete.role === "Admin") {
+      const adminCount = await db.collection("users").countDocuments({ role: "Admin" });
+      if (adminCount <= 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Cannot delete the last admin user",
+        });
+      }
+    }
+
     const result = await db.collection("users").deleteOne({
       _id: new ObjectId(req.params.id),
     });

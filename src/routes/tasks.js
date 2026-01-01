@@ -395,7 +395,7 @@ router.delete("/:id", protect, async (req, res) => {
       });
     }
 
-    // SAFETY CHECK: Validate ownership - buyer can only delete their own tasks
+    // SAFETY CHECK: Validate ownership - buyer can only delete their own tasks, admin can delete any
     if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
       return res.status(403).json({
         success: false,
@@ -403,40 +403,59 @@ router.delete("/:id", protect, async (req, res) => {
       });
     }
 
-    // SAFETY CHECK: Prevent delete if task is completed
-    if (task.completedCount >= task.quantity) {
+    // For regular buyers (non-admin), prevent delete if task is completed
+    if (req.user.role !== "Admin" && task.completedCount >= task.quantity) {
       return res.status(400).json({
         success: false,
         message: "Cannot delete a completed task",
       });
     }
 
-    // Calculate refund for remaining slots
-    const remainingSlots = task.quantity - task.completedCount;
-    const refund = remainingSlots * task.reward;
+    // Admin override: Do NOT refund coins (as per requirement)
+    if (req.user.role === "Admin") {
+      // Delete the task without refunding
+      await db.collection("tasks").deleteOne({ _id: new ObjectId(req.params.id) });
 
-    // Refund coins to buyer
-    if (refund > 0) {
-      await db.collection("users").updateOne(
-        { _id: task.buyer },
-        { $inc: { coin: refund } }
-      );
+      // Delete all related submissions (both pending and completed)
+      const deletedSubmissions = await db.collection("submissions").deleteMany({ 
+        task: new ObjectId(req.params.id)
+      });
+
+      res.json({
+        success: true,
+        message: "Task deleted successfully (admin override)",
+        deletedSubmissions: deletedSubmissions.deletedCount,
+        refunded: 0, // No refund for admin deletion
+      });
+    } else {
+      // Regular buyer deletion logic (with refund)
+      const remainingSlots = task.quantity - task.completedCount;
+      const refund = remainingSlots * task.reward;
+
+      // Refund coins to buyer
+      if (refund > 0) {
+        await db.collection("users").updateOne(
+          { _id: task.buyer },
+          { $inc: { coin: refund } }
+        );
+      }
+
+      // Delete the task
+      await db.collection("tasks").deleteOne({ _id: new ObjectId(req.params.id) });
+
+      // Delete only pending submissions for regular deletion
+      const deletedSubmissions = await db.collection("submissions").deleteMany({ 
+        task: new ObjectId(req.params.id),
+        status: "pending"
+      });
+
+      res.json({
+        success: true,
+        message: "Task deleted successfully",
+        deletedSubmissions: deletedSubmissions.deletedCount,
+        refunded: refund,
+      });
     }
-
-    // Delete the task
-    await db.collection("tasks").deleteOne({ _id: new ObjectId(req.params.id) });
-
-    // Also delete any pending submissions for this task
-    await db.collection("submissions").deleteMany({ 
-      task: new ObjectId(req.params.id),
-      status: "pending"
-    });
-
-    res.json({
-      success: true,
-      message: "Task deleted successfully",
-      refunded: refund,
-    });
   } catch (error) {
     res.status(500).json({
       success: false,
