@@ -22,7 +22,16 @@ router.get("/", protect, async (req, res) => {
       query.task = { $in: buyerTasks.map((t) => t._id) };
     }
 
-    if (task) query.task = new ObjectId(task);
+    if (task) {
+      // Validate ObjectId format
+      if (!ObjectId.isValid(task)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid task ID format",
+        });
+      }
+      query.task = new ObjectId(task);
+    }
     if (status) query.status = status;
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -89,7 +98,7 @@ router.get("/", protect, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to fetch submissions. Please try again.",
     });
   }
 });
@@ -98,6 +107,23 @@ router.get("/", protect, async (req, res) => {
 router.post("/", protect, restrictTo("Worker"), async (req, res) => {
   try {
     const { taskId, submissionDetails } = req.body;
+
+    // Validate required fields
+    if (!taskId || !submissionDetails) {
+      return res.status(400).json({
+        success: false,
+        message: "Task ID and submission details are required",
+      });
+    }
+
+    // Validate ObjectId format
+    if (!ObjectId.isValid(taskId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID format",
+      });
+    }
+
     const db = getDb();
 
     const task = await db.collection("tasks").findOne({ 
@@ -158,7 +184,7 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to create submission. Please try again.",
     });
   }
 });
@@ -168,14 +194,25 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
   try {
     const { status, feedback } = req.body;
 
-    if (!["approved", "rejected"].includes(status)) {
+    // Validate ObjectId format
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).json({
         success: false,
-        message: "Status must be approved or rejected",
+        message: "Invalid submission ID format",
+      });
+    }
+
+    // Validate status
+    if (!status || !["approved", "rejected"].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Status must be 'approved' or 'rejected'",
       });
     }
 
     const db = getDb();
+    
+    // Use findOne to get current state before any updates
     const submission = await db.collection("submissions").findOne({ 
       _id: new ObjectId(req.params.id) 
     });
@@ -187,22 +224,30 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
       });
     }
 
+    // SAFETY CHECK: Prevent double approval/rejection
+    if (submission.status !== "pending") {
+      return res.status(400).json({
+        success: false,
+        message: `Submission has already been ${submission.status}. Cannot review again.`,
+      });
+    }
+
     const task = await db.collection("tasks").findOne({ 
       _id: submission.task 
     });
 
-    // Check if user owns the task
-    if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
-      return res.status(403).json({
+    if (!task) {
+      return res.status(404).json({
         success: false,
-        message: "Not authorized to review this submission",
+        message: "Associated task not found",
       });
     }
 
-    if (submission.status !== "pending") {
-      return res.status(400).json({
+    // SAFETY CHECK: Validate ownership - buyer can only review their own tasks
+    if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
+      return res.status(403).json({
         success: false,
-        message: "Submission has already been reviewed",
+        message: "Not authorized to review this submission. You can only review submissions for your own tasks.",
       });
     }
 
@@ -215,6 +260,8 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
     if (status === "approved") {
       // Pay the worker
       updates.rewardPaid = task.reward;
+      
+      // Update worker coins
       await db.collection("users").updateOne(
         { _id: submission.worker },
         { $inc: { coin: task.reward } }
@@ -225,13 +272,30 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
         { _id: task._id },
         { $inc: { completedCount: 1 } }
       );
+    } else if (status === "rejected") {
+      // Increase quantity by 1 to allow another worker to take the slot
+      await db.collection("tasks").updateOne(
+        { _id: task._id },
+        { $inc: { quantity: 1 } }
+      );
     }
 
+    // Use findOneAndUpdate with condition to prevent race conditions
     const result = await db.collection("submissions").findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      { 
+        _id: new ObjectId(req.params.id),
+        status: "pending" // Only update if still pending
+      },
       { $set: updates },
       { returnDocument: "after" }
     );
+
+    if (!result) {
+      return res.status(400).json({
+        success: false,
+        message: "Submission was already reviewed by another process",
+      });
+    }
 
     res.json({
       success: true,
@@ -240,7 +304,7 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to review submission. Please try again.",
     });
   }
 });

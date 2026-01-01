@@ -13,7 +13,16 @@ router.get("/", async (req, res) => {
 
     if (status) query.status = status;
     if (category) query.category = category;
-    if (buyer) query.buyer = new ObjectId(buyer);
+    if (buyer) {
+      // Validate ObjectId format
+      if (!ObjectId.isValid(buyer)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid buyer ID format",
+        });
+      }
+      query.buyer = new ObjectId(buyer);
+    }
 
     const db = getDb();
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -62,7 +71,7 @@ router.get("/", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to fetch tasks. Please try again.",
     });
   }
 });
@@ -70,6 +79,14 @@ router.get("/", async (req, res) => {
 // Get single task
 router.get("/:id", async (req, res) => {
   try {
+    // Validate ObjectId format
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID format",
+      });
+    }
+
     const db = getDb();
     
     const tasks = await db.collection("tasks").aggregate([
@@ -114,7 +131,7 @@ router.get("/:id", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to fetch task. Please try again.",
     });
   }
 });
@@ -122,35 +139,84 @@ router.get("/:id", async (req, res) => {
 // Create task (Buyer only)
 router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
   try {
-    const { title, description, category, reward, quantity, requirements, submissionInfo, deadline } = req.body;
+    const { title, description, category, reward, quantity, requirements, submissionInfo, deadline, imageUrl } = req.body;
 
-    // Check if buyer has enough coins
-    const totalCost = reward * quantity;
-    if (req.user.coin < totalCost) {
+    // Validate required fields
+    if (!title || !description || !reward || !quantity) {
       return res.status(400).json({
         success: false,
-        message: `Insufficient coins. You need ${totalCost} coins but have ${req.user.coin}`,
+        message: "Title, description, reward, and quantity are required",
       });
     }
 
-    const db = getDb();
+    // SAFETY CHECK: Validate positive numbers
+    if (reward <= 0 || quantity <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Reward and quantity must be positive numbers",
+      });
+    }
 
-    // Deduct coins from buyer
-    await db.collection("users").updateOne(
-      { _id: req.user._id },
+    // SAFETY CHECK: Validate integers
+    if (!Number.isInteger(reward) || !Number.isInteger(quantity)) {
+      return res.status(400).json({
+        success: false,
+        message: "Reward and quantity must be whole numbers",
+      });
+    }
+
+    const totalCost = reward * quantity;
+
+    // Get fresh user data to check current coin balance
+    const db = getDb();
+    const currentUser = await db.collection("users").findOne({ _id: req.user._id });
+
+    if (!currentUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // SAFETY CHECK: Prevent negative coin balance
+    if (currentUser.coin < totalCost) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient coins. You need ${totalCost} coins but have ${currentUser.coin}`,
+        insufficientCoins: true,
+        required: totalCost,
+        available: currentUser.coin,
+      });
+    }
+
+    // SAFETY CHECK: Use atomic operation to prevent race conditions
+    const updateResult = await db.collection("users").updateOne(
+      { 
+        _id: req.user._id,
+        coin: { $gte: totalCost } // Only deduct if sufficient balance
+      },
       { $inc: { coin: -totalCost } }
     );
+
+    if (updateResult.modifiedCount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Insufficient coins or balance changed. Please try again.",
+        insufficientCoins: true,
+      });
+    }
 
     const newTask = {
       title,
       description,
       buyer: req.user._id,
-      category,
+      category: category || "",
       reward,
       quantity,
       completedCount: 0,
       requirements: requirements || "",
       submissionInfo: submissionInfo || "",
+      imageUrl: imageUrl || "",
       deadline: deadline ? new Date(deadline) : null,
       status: "active",
       createdAt: new Date(),
@@ -165,7 +231,7 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to create task. Please try again.",
     });
   }
 });
@@ -173,6 +239,14 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
 // Update task (Owner or Admin)
 router.patch("/:id", protect, async (req, res) => {
   try {
+    // Validate ObjectId format
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID format",
+      });
+    }
+
     const db = getDb();
     const task = await db.collection("tasks").findOne({ 
       _id: new ObjectId(req.params.id) 
@@ -185,24 +259,38 @@ router.patch("/:id", protect, async (req, res) => {
       });
     }
 
-    // Check ownership
+    // SAFETY CHECK: Validate ownership - buyer can only update their own tasks
     if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
       return res.status(403).json({
         success: false,
-        message: "Not authorized to update this task",
+        message: "Not authorized to update this task. You can only update your own tasks.",
       });
     }
 
-    const allowedUpdates = ["title", "description", "requirements", "submissionInfo", "status", "deadline"];
+    // SAFETY CHECK: Prevent update if task is completed
+    if (task.completedCount >= task.quantity) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot update a completed task",
+      });
+    }
+
+    // Only allow specific fields to be updated
+    const allowedUpdates = ["title", "description", "submissionInfo"];
     const updates = {};
 
     allowedUpdates.forEach((field) => {
       if (req.body[field] !== undefined) {
-        updates[field] = field === "deadline" && req.body[field] 
-          ? new Date(req.body[field]) 
-          : req.body[field];
+        updates[field] = req.body[field];
       }
     });
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid fields to update. Allowed fields: title, description, submissionInfo",
+      });
+    }
 
     const result = await db.collection("tasks").findOneAndUpdate(
       { _id: new ObjectId(req.params.id) },
@@ -217,7 +305,7 @@ router.patch("/:id", protect, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to update task. Please try again.",
     });
   }
 });
@@ -225,6 +313,14 @@ router.patch("/:id", protect, async (req, res) => {
 // Delete task (Owner or Admin)
 router.delete("/:id", protect, async (req, res) => {
   try {
+    // Validate ObjectId format
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid task ID format",
+      });
+    }
+
     const db = getDb();
     const task = await db.collection("tasks").findOne({ 
       _id: new ObjectId(req.params.id) 
@@ -237,18 +333,27 @@ router.delete("/:id", protect, async (req, res) => {
       });
     }
 
-    // Check ownership
+    // SAFETY CHECK: Validate ownership - buyer can only delete their own tasks
     if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
       return res.status(403).json({
         success: false,
-        message: "Not authorized to delete this task",
+        message: "Not authorized to delete this task. You can only delete your own tasks.",
       });
     }
 
-    // Refund remaining coins
+    // SAFETY CHECK: Prevent delete if task is completed
+    if (task.completedCount >= task.quantity) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot delete a completed task",
+      });
+    }
+
+    // Calculate refund for remaining slots
     const remainingSlots = task.quantity - task.completedCount;
     const refund = remainingSlots * task.reward;
 
+    // Refund coins to buyer
     if (refund > 0) {
       await db.collection("users").updateOne(
         { _id: task.buyer },
@@ -256,7 +361,14 @@ router.delete("/:id", protect, async (req, res) => {
       );
     }
 
+    // Delete the task
     await db.collection("tasks").deleteOne({ _id: new ObjectId(req.params.id) });
+
+    // Also delete any pending submissions for this task
+    await db.collection("submissions").deleteMany({ 
+      task: new ObjectId(req.params.id),
+      status: "pending"
+    });
 
     res.json({
       success: true,
@@ -266,7 +378,7 @@ router.delete("/:id", protect, async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to delete task. Please try again.",
     });
   }
 });
