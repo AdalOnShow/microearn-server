@@ -1,16 +1,20 @@
 require("dotenv").config();
-const mongoose = require("mongoose");
+const { MongoClient } = require("mongodb");
 const bcrypt = require("bcryptjs");
-const User = require("./models/User");
 
 const seedAdmin = async () => {
+  let client;
+  
   try {
-    await mongoose.connect(process.env.MONGODB_URI);
+    client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    const db = client.db();
+    
     console.log("Connected to MongoDB");
 
     const adminEmail = "admin@microearn.com";
     
-    const existingAdmin = await User.findOne({ email: adminEmail });
+    const existingAdmin = await db.collection("users").findOne({ email: adminEmail });
     
     if (existingAdmin) {
       console.log("Admin user already exists");
@@ -19,13 +23,15 @@ const seedAdmin = async () => {
 
     const hashedPassword = await bcrypt.hash("admin123456", 12);
 
-    await User.create({
+    await db.collection("users").insertOne({
       name: "Admin",
       email: adminEmail,
       password: hashedPassword,
+      image: "",
       role: "Admin",
       coin: 0,
       provider: "credentials",
+      createdAt: new Date(),
     });
 
     console.log("Admin user created successfully");
@@ -36,6 +42,10 @@ const seedAdmin = async () => {
   } catch (error) {
     console.error("Error seeding admin:", error);
     process.exit(1);
+  } finally {
+    if (client) {
+      await client.close();
+    }
   }
 };
 

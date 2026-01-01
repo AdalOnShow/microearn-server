@@ -1,6 +1,6 @@
 const express = require("express");
-const Task = require("../models/Task");
-const User = require("../models/User");
+const { ObjectId } = require("mongodb");
+const { getDb } = require("../config/db");
 const { protect, restrictTo } = require("../middleware/auth");
 
 const router = express.Router();
@@ -13,21 +13,50 @@ router.get("/", async (req, res) => {
 
     if (status) query.status = status;
     if (category) query.category = category;
-    if (buyer) query.buyer = buyer;
+    if (buyer) query.buyer = new ObjectId(buyer);
 
-    const tasks = await Task.find(query)
-      .populate("buyer", "name email image")
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+    const db = getDb();
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const total = await Task.countDocuments(query);
+    // Get tasks with buyer info using aggregation
+    const tasks = await db.collection("tasks").aggregate([
+      { $match: query },
+      { $sort: { createdAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+      {
+        $lookup: {
+          from: "users",
+          localField: "buyer",
+          foreignField: "_id",
+          as: "buyerInfo"
+        }
+      },
+      {
+        $addFields: {
+          buyer: {
+            $let: {
+              vars: { buyerData: { $arrayElemAt: ["$buyerInfo", 0] } },
+              in: {
+                _id: "$$buyerData._id",
+                name: "$$buyerData.name",
+                email: "$$buyerData.email",
+                image: "$$buyerData.image"
+              }
+            }
+          }
+        }
+      },
+      { $project: { buyerInfo: 0 } }
+    ]).toArray();
+
+    const total = await db.collection("tasks").countDocuments(query);
 
     res.json({
       success: true,
       count: tasks.length,
       total,
-      pages: Math.ceil(total / limit),
+      pages: Math.ceil(total / parseInt(limit)),
       tasks,
     });
   } catch (error) {
@@ -41,12 +70,37 @@ router.get("/", async (req, res) => {
 // Get single task
 router.get("/:id", async (req, res) => {
   try {
-    const task = await Task.findById(req.params.id).populate(
-      "buyer",
-      "name email image"
-    );
+    const db = getDb();
+    
+    const tasks = await db.collection("tasks").aggregate([
+      { $match: { _id: new ObjectId(req.params.id) } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "buyer",
+          foreignField: "_id",
+          as: "buyerInfo"
+        }
+      },
+      {
+        $addFields: {
+          buyer: {
+            $let: {
+              vars: { buyerData: { $arrayElemAt: ["$buyerInfo", 0] } },
+              in: {
+                _id: "$$buyerData._id",
+                name: "$$buyerData.name",
+                email: "$$buyerData.email",
+                image: "$$buyerData.image"
+              }
+            }
+          }
+        }
+      },
+      { $project: { buyerInfo: 0 } }
+    ]).toArray();
 
-    if (!task) {
+    if (tasks.length === 0) {
       return res.status(404).json({
         success: false,
         message: "Task not found",
@@ -55,7 +109,7 @@ router.get("/:id", async (req, res) => {
 
     res.json({
       success: true,
-      task,
+      task: tasks[0],
     });
   } catch (error) {
     res.status(500).json({
@@ -79,26 +133,34 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
       });
     }
 
-    // Deduct coins from buyer
-    await User.findByIdAndUpdate(req.user._id, {
-      $inc: { coin: -totalCost },
-    });
+    const db = getDb();
 
-    const task = await Task.create({
+    // Deduct coins from buyer
+    await db.collection("users").updateOne(
+      { _id: req.user._id },
+      { $inc: { coin: -totalCost } }
+    );
+
+    const newTask = {
       title,
       description,
       buyer: req.user._id,
       category,
       reward,
       quantity,
-      requirements,
-      submissionInfo,
-      deadline,
-    });
+      completedCount: 0,
+      requirements: requirements || "",
+      submissionInfo: submissionInfo || "",
+      deadline: deadline ? new Date(deadline) : null,
+      status: "active",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("tasks").insertOne(newTask);
 
     res.status(201).json({
       success: true,
-      task,
+      task: { ...newTask, _id: result.insertedId },
     });
   } catch (error) {
     res.status(500).json({
@@ -111,7 +173,10 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
 // Update task (Owner or Admin)
 router.patch("/:id", protect, async (req, res) => {
   try {
-    const task = await Task.findById(req.params.id);
+    const db = getDb();
+    const task = await db.collection("tasks").findOne({ 
+      _id: new ObjectId(req.params.id) 
+    });
 
     if (!task) {
       return res.status(404).json({
@@ -133,18 +198,21 @@ router.patch("/:id", protect, async (req, res) => {
 
     allowedUpdates.forEach((field) => {
       if (req.body[field] !== undefined) {
-        updates[field] = req.body[field];
+        updates[field] = field === "deadline" && req.body[field] 
+          ? new Date(req.body[field]) 
+          : req.body[field];
       }
     });
 
-    const updatedTask = await Task.findByIdAndUpdate(req.params.id, updates, {
-      new: true,
-      runValidators: true,
-    });
+    const result = await db.collection("tasks").findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
 
     res.json({
       success: true,
-      task: updatedTask,
+      task: result,
     });
   } catch (error) {
     res.status(500).json({
@@ -157,7 +225,10 @@ router.patch("/:id", protect, async (req, res) => {
 // Delete task (Owner or Admin)
 router.delete("/:id", protect, async (req, res) => {
   try {
-    const task = await Task.findById(req.params.id);
+    const db = getDb();
+    const task = await db.collection("tasks").findOne({ 
+      _id: new ObjectId(req.params.id) 
+    });
 
     if (!task) {
       return res.status(404).json({
@@ -179,12 +250,13 @@ router.delete("/:id", protect, async (req, res) => {
     const refund = remainingSlots * task.reward;
 
     if (refund > 0) {
-      await User.findByIdAndUpdate(task.buyer, {
-        $inc: { coin: refund },
-      });
+      await db.collection("users").updateOne(
+        { _id: task.buyer },
+        { $inc: { coin: refund } }
+      );
     }
 
-    await Task.findByIdAndDelete(req.params.id);
+    await db.collection("tasks").deleteOne({ _id: new ObjectId(req.params.id) });
 
     res.json({
       success: true,

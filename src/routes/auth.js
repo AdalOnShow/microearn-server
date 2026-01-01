@@ -1,5 +1,6 @@
 const express = require("express");
-const User = require("../models/User");
+const bcrypt = require("bcryptjs");
+const { getDb } = require("../config/db");
 const { generateToken, protect } = require("../middleware/auth");
 
 const router = express.Router();
@@ -23,7 +24,9 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    const existingUser = await User.findOne({ email });
+    const db = getDb();
+    
+    const existingUser = await db.collection("users").findOne({ email: email.toLowerCase() });
     if (existingUser) {
       return res.status(400).json({
         success: false,
@@ -31,31 +34,36 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // Set coins based on role
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
+
+    // Set coins based on role (only on first registration)
     const coin = role === "Worker" ? 10 : 50;
 
-    const user = await User.create({
-      name,
-      email,
-      password,
+    const newUser = {
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
       image: image || "",
       role,
       coin,
       provider: "credentials",
-    });
+      createdAt: new Date(),
+    };
 
-    const token = generateToken(user._id);
+    const result = await db.collection("users").insertOne(newUser);
+    const token = generateToken(result.insertedId.toString());
 
     res.status(201).json({
       success: true,
       token,
       user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        image: user.image,
-        role: user.role,
-        coin: user.coin,
+        id: result.insertedId,
+        name: newUser.name,
+        email: newUser.email,
+        image: newUser.image,
+        role: newUser.role,
+        coin: newUser.coin,
       },
     });
   } catch (error) {
@@ -78,7 +86,8 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const user = await User.findOne({ email }).select("+password");
+    const db = getDb();
+    const user = await db.collection("users").findOne({ email: email.toLowerCase() });
 
     if (!user) {
       return res.status(401).json({
@@ -94,7 +103,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
       return res.status(401).json({
@@ -103,7 +112,7 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id.toString());
 
     res.json({
       success: true,
@@ -137,21 +146,26 @@ router.post("/google", async (req, res) => {
       });
     }
 
-    let user = await User.findOne({ email });
+    const db = getDb();
+    let user = await db.collection("users").findOne({ email: email.toLowerCase() });
 
     if (!user) {
       // Create new user with default Worker role
-      user = await User.create({
+      const newUser = {
         name,
-        email,
+        email: email.toLowerCase(),
         image,
         role: "Worker",
         coin: 10,
         provider: "google",
-      });
+        createdAt: new Date(),
+      };
+
+      const result = await db.collection("users").insertOne(newUser);
+      user = { ...newUser, _id: result.insertedId };
     }
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id.toString());
 
     res.json({
       success: true,

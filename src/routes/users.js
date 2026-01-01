@@ -1,5 +1,6 @@
 const express = require("express");
-const User = require("../models/User");
+const { ObjectId } = require("mongodb");
+const { getDb } = require("../config/db");
 const { protect, restrictTo } = require("../middleware/auth");
 
 const router = express.Router();
@@ -7,7 +8,11 @@ const router = express.Router();
 // Get all users (Admin only)
 router.get("/", protect, restrictTo("Admin"), async (req, res) => {
   try {
-    const users = await User.find().select("-password");
+    const db = getDb();
+    const users = await db.collection("users")
+      .find({}, { projection: { password: 0 } })
+      .toArray();
+
     res.json({
       success: true,
       count: users.length,
@@ -25,10 +30,16 @@ router.get("/", protect, restrictTo("Admin"), async (req, res) => {
 router.get("/top-workers", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 6;
-    const workers = await User.find({ role: "Worker" })
-      .select("name image coin")
+    const db = getDb();
+    
+    const workers = await db.collection("users")
+      .find(
+        { role: "Worker" },
+        { projection: { name: 1, image: 1, coin: 1 } }
+      )
       .sort({ coin: -1 })
-      .limit(limit);
+      .limit(limit)
+      .toArray();
 
     res.json({
       success: true,
@@ -45,7 +56,11 @@ router.get("/top-workers", async (req, res) => {
 // Get user by ID
 router.get("/:id", protect, async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select("-password");
+    const db = getDb();
+    const user = await db.collection("users").findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { password: 0 } }
+    );
 
     if (!user) {
       return res.status(404).json({
@@ -75,14 +90,16 @@ router.patch("/profile", protect, async (req, res) => {
     if (name) updates.name = name;
     if (image !== undefined) updates.image = image;
 
-    const user = await User.findByIdAndUpdate(req.user._id, updates, {
-      new: true,
-      runValidators: true,
-    }).select("-password");
+    const db = getDb();
+    const result = await db.collection("users").findOneAndUpdate(
+      { _id: req.user._id },
+      { $set: updates },
+      { returnDocument: "after", projection: { password: 0 } }
+    );
 
     res.json({
       success: true,
-      user,
+      user: result,
     });
   } catch (error) {
     res.status(500).json({
@@ -104,13 +121,14 @@ router.patch("/:id/role", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      { role },
-      { new: true }
-    ).select("-password");
+    const db = getDb();
+    const result = await db.collection("users").findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { role } },
+      { returnDocument: "after", projection: { password: 0 } }
+    );
 
-    if (!user) {
+    if (!result) {
       return res.status(404).json({
         success: false,
         message: "User not found",
@@ -119,7 +137,7 @@ router.patch("/:id/role", protect, restrictTo("Admin"), async (req, res) => {
 
     res.json({
       success: true,
-      user,
+      user: result,
     });
   } catch (error) {
     res.status(500).json({
@@ -132,9 +150,12 @@ router.patch("/:id/role", protect, restrictTo("Admin"), async (req, res) => {
 // Delete user (Admin only)
 router.delete("/:id", protect, restrictTo("Admin"), async (req, res) => {
   try {
-    const user = await User.findByIdAndDelete(req.params.id);
+    const db = getDb();
+    const result = await db.collection("users").deleteOne({ 
+      _id: new ObjectId(req.params.id) 
+    });
 
-    if (!user) {
+    if (result.deletedCount === 0) {
       return res.status(404).json({
         success: false,
         message: "User not found",

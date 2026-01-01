@@ -1,6 +1,6 @@
 const express = require("express");
-const Withdrawal = require("../models/Withdrawal");
-const User = require("../models/User");
+const { ObjectId } = require("mongodb");
+const { getDb } = require("../config/db");
 const { protect, restrictTo } = require("../middleware/auth");
 
 const router = express.Router();
@@ -9,6 +9,7 @@ const router = express.Router();
 router.get("/", protect, async (req, res) => {
   try {
     const { status, page = 1, limit = 10 } = req.query;
+    const db = getDb();
     const query = {};
 
     // Non-admins only see their own withdrawals
@@ -18,19 +19,46 @@ router.get("/", protect, async (req, res) => {
 
     if (status) query.status = status;
 
-    const withdrawals = await Withdrawal.find(query)
-      .populate("user", "name email")
-      .sort({ requestedAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+    const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const total = await Withdrawal.countDocuments(query);
+    // Get withdrawals with user info
+    const withdrawals = await db.collection("withdrawals").aggregate([
+      { $match: query },
+      { $sort: { requestedAt: -1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+      {
+        $lookup: {
+          from: "users",
+          localField: "user",
+          foreignField: "_id",
+          as: "userInfo"
+        }
+      },
+      {
+        $addFields: {
+          user: {
+            $let: {
+              vars: { userData: { $arrayElemAt: ["$userInfo", 0] } },
+              in: {
+                _id: "$$userData._id",
+                name: "$$userData.name",
+                email: "$$userData.email"
+              }
+            }
+          }
+        }
+      },
+      { $project: { userInfo: 0 } }
+    ]).toArray();
+
+    const total = await db.collection("withdrawals").countDocuments(query);
 
     res.json({
       success: true,
       count: withdrawals.length,
       total,
-      pages: Math.ceil(total / limit),
+      pages: Math.ceil(total / parseInt(limit)),
       withdrawals,
     });
   } catch (error) {
@@ -60,21 +88,30 @@ router.post("/", protect, async (req, res) => {
       });
     }
 
-    // Deduct coins immediately
-    await User.findByIdAndUpdate(req.user._id, {
-      $inc: { coin: -amount },
-    });
+    const db = getDb();
 
-    const withdrawal = await Withdrawal.create({
+    // Deduct coins immediately
+    await db.collection("users").updateOne(
+      { _id: req.user._id },
+      { $inc: { coin: -amount } }
+    );
+
+    const newWithdrawal = {
       user: req.user._id,
       amount,
       paymentMethod,
       paymentDetails,
-    });
+      status: "pending",
+      adminNote: "",
+      requestedAt: new Date(),
+      processedAt: null,
+    };
+
+    const result = await db.collection("withdrawals").insertOne(newWithdrawal);
 
     res.status(201).json({
       success: true,
-      withdrawal,
+      withdrawal: { ...newWithdrawal, _id: result.insertedId },
     });
   } catch (error) {
     res.status(500).json({
@@ -96,7 +133,10 @@ router.patch("/:id", protect, restrictTo("Admin"), async (req, res) => {
       });
     }
 
-    const withdrawal = await Withdrawal.findById(req.params.id);
+    const db = getDb();
+    const withdrawal = await db.collection("withdrawals").findOne({ 
+      _id: new ObjectId(req.params.id) 
+    });
 
     if (!withdrawal) {
       return res.status(404).json({
@@ -107,19 +147,27 @@ router.patch("/:id", protect, restrictTo("Admin"), async (req, res) => {
 
     // If rejected, refund coins
     if (status === "rejected" && withdrawal.status === "pending") {
-      await User.findByIdAndUpdate(withdrawal.user, {
-        $inc: { coin: withdrawal.amount },
-      });
+      await db.collection("users").updateOne(
+        { _id: withdrawal.user },
+        { $inc: { coin: withdrawal.amount } }
+      );
     }
 
-    withdrawal.status = status;
-    withdrawal.adminNote = adminNote || "";
-    withdrawal.processedAt = new Date();
-    await withdrawal.save();
+    const result = await db.collection("withdrawals").findOneAndUpdate(
+      { _id: new ObjectId(req.params.id) },
+      { 
+        $set: { 
+          status, 
+          adminNote: adminNote || "",
+          processedAt: new Date()
+        } 
+      },
+      { returnDocument: "after" }
+    );
 
     res.json({
       success: true,
-      withdrawal,
+      withdrawal: result,
     });
   } catch (error) {
     res.status(500).json({

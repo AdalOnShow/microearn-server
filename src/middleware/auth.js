@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
-const User = require("../models/User");
+const { ObjectId } = require("mongodb");
+const { getDb } = require("../config/db");
 
 // Protect routes - verify JWT
 const protect = async (req, res, next) => {
@@ -18,7 +19,10 @@ const protect = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id);
+    const db = getDb();
+    const user = await db.collection("users").findOne({ 
+      _id: new ObjectId(decoded.id) 
+    });
 
     if (!user) {
       return res.status(401).json({
