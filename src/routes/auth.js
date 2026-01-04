@@ -10,23 +10,66 @@ router.post("/register", async (req, res) => {
   try {
     const { name, email, password, image, role } = req.body;
 
+    // VALIDATION FIX: Enhanced input validation
     if (!name || !email || !password || !role) {
       return res.status(400).json({
         success: false,
-        message: "Please provide name, email, password, and role",
+        message: "Name, email, password, and role are required",
       });
     }
 
+    // VALIDATION FIX: Validate name
+    const cleanName = name.trim();
+    if (cleanName.length < 2 || cleanName.length > 50) {
+      return res.status(400).json({
+        success: false,
+        message: "Name must be between 2 and 50 characters",
+      });
+    }
+
+    if (!/^[a-zA-Z\s'-]+$/.test(cleanName)) {
+      return res.status(400).json({
+        success: false,
+        message: "Name can only contain letters, spaces, hyphens, and apostrophes",
+      });
+    }
+
+    // VALIDATION FIX: Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanEmail = email.toLowerCase().trim();
+    if (!emailRegex.test(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email address",
+      });
+    }
+
+    // VALIDATION FIX: Enhanced password validation
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters long",
+      });
+    }
+
+    if (password.length > 128) {
+      return res.status(400).json({
+        success: false,
+        message: "Password cannot exceed 128 characters",
+      });
+    }
+
+    // VALIDATION FIX: Validate role
     if (!["Worker", "Buyer"].includes(role)) {
       return res.status(400).json({
         success: false,
-        message: "Role must be Worker or Buyer",
+        message: "Role must be either 'Worker' or 'Buyer'",
       });
     }
 
     const db = getDb();
     
-    const existingUser = await db.collection("users").findOne({ email: email.toLowerCase() });
+    const existingUser = await db.collection("users").findOne({ email: cleanEmail });
     if (existingUser) {
       return res.status(400).json({
         success: false,
@@ -41,10 +84,10 @@ router.post("/register", async (req, res) => {
     const coin = role === "Worker" ? 10 : 50;
 
     const newUser = {
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
+      name: cleanName,
+      email: cleanEmail,
       password: hashedPassword,
-      image: image || "",
+      image: image ? image.trim() : "",
       role,
       coin,
       provider: "credentials",
@@ -67,9 +110,10 @@ router.post("/register", async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("Registration error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Registration failed. Please try again.",
     });
   }
 });
@@ -79,15 +123,34 @@ router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // VALIDATION FIX: Enhanced input validation
     if (!email || !password) {
       return res.status(400).json({
         success: false,
-        message: "Please provide email and password",
+        message: "Email and password are required",
+      });
+    }
+
+    // VALIDATION FIX: Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanEmail = email.toLowerCase().trim();
+    if (!emailRegex.test(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide a valid email address",
+      });
+    }
+
+    // VALIDATION FIX: Basic password validation
+    if (typeof password !== "string" || password.length < 1) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid password",
       });
     }
 
     const db = getDb();
-    const user = await db.collection("users").findOne({ email: email.toLowerCase() });
+    const user = await db.collection("users").findOne({ email: cleanEmail });
 
     if (!user) {
       return res.status(401).json({
@@ -100,6 +163,13 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({
         success: false,
         message: "Please login with Google",
+      });
+    }
+
+    if (!user.password) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password",
       });
     }
 
@@ -127,9 +197,10 @@ router.post("/login", async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("Login error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Login failed. Please try again.",
     });
   }
 });

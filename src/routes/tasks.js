@@ -211,23 +211,72 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
       });
     }
 
-    // SAFETY CHECK: Validate positive numbers
-    if (reward <= 0 || quantity <= 0) {
+    // VALIDATION FIX: Validate title and description length
+    if (title.trim().length < 3 || title.trim().length > 200) {
       return res.status(400).json({
         success: false,
-        message: "Reward and quantity must be positive numbers",
+        message: "Title must be between 3 and 200 characters",
       });
     }
 
-    // SAFETY CHECK: Validate integers
-    if (!Number.isInteger(reward) || !Number.isInteger(quantity)) {
+    if (description.trim().length < 10 || description.trim().length > 2000) {
       return res.status(400).json({
         success: false,
-        message: "Reward and quantity must be whole numbers",
+        message: "Description must be between 10 and 2000 characters",
       });
     }
 
-    const totalCost = reward * quantity;
+    // VALIDATION FIX: Validate numeric inputs properly
+    const rewardNum = parseInt(reward);
+    const quantityNum = parseInt(quantity);
+
+    if (isNaN(rewardNum) || rewardNum <= 0 || rewardNum > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Reward must be a positive number between 1 and 1000 coins",
+      });
+    }
+
+    if (isNaN(quantityNum) || quantityNum <= 0 || quantityNum > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Quantity must be a positive number between 1 and 1000",
+      });
+    }
+
+    // VALIDATION FIX: Prevent task creation with past deadline
+    let deadlineDate = null;
+    if (deadline) {
+      deadlineDate = new Date(deadline);
+      const now = new Date();
+      
+      if (isNaN(deadlineDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid deadline format",
+        });
+      }
+
+      if (deadlineDate <= now) {
+        return res.status(400).json({
+          success: false,
+          message: "Deadline must be in the future",
+        });
+      }
+
+      // Ensure deadline is not too far in the future (max 1 year)
+      const oneYearFromNow = new Date();
+      oneYearFromNow.setFullYear(oneYearFromNow.getFullYear() + 1);
+      
+      if (deadlineDate > oneYearFromNow) {
+        return res.status(400).json({
+          success: false,
+          message: "Deadline cannot be more than 1 year in the future",
+        });
+      }
+    }
+
+    const totalCost = rewardNum * quantityNum;
 
     // Get fresh user data to check current coin balance
     const db = getDb();
@@ -269,17 +318,17 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
     }
 
     const newTask = {
-      title,
-      description,
+      title: title.trim(),
+      description: description.trim(),
       buyer: req.user._id,
-      category: category || "",
-      reward,
-      quantity,
+      category: category ? category.trim() : "",
+      reward: rewardNum,
+      quantity: quantityNum,
       completedCount: 0,
-      requirements: requirements || "",
-      submissionInfo: submissionInfo || "",
-      imageUrl: imageUrl || "",
-      deadline: deadline ? new Date(deadline) : null,
+      requirements: requirements ? requirements.trim() : "",
+      submissionInfo: submissionInfo ? submissionInfo.trim() : "",
+      imageUrl: imageUrl ? imageUrl.trim() : "",
+      deadline: deadlineDate,
       status: "active",
       createdAt: new Date(),
     };
@@ -291,6 +340,7 @@ router.post("/", protect, restrictTo("Buyer", "Admin"), async (req, res) => {
       task: { ...newTask, _id: result.insertedId },
     });
   } catch (error) {
+    console.error("Task creation error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to create task. Please try again.",

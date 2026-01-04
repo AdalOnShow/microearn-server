@@ -126,6 +126,7 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
   try {
     const { taskId, submissionDetails } = req.body;
 
+    // VALIDATION FIX: Enhanced input validation
     if (!taskId || !submissionDetails) {
       return res.status(400).json({
         success: false,
@@ -137,6 +138,21 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid task ID format",
+      });
+    }
+
+    // VALIDATION FIX: Validate submission details
+    if (typeof submissionDetails !== "string" || submissionDetails.trim().length < 10) {
+      return res.status(400).json({
+        success: false,
+        message: "Submission details must be at least 10 characters long",
+      });
+    }
+
+    if (submissionDetails.trim().length > 5000) {
+      return res.status(400).json({
+        success: false,
+        message: "Submission details cannot exceed 5000 characters",
       });
     }
 
@@ -175,6 +191,7 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       });
     }
 
+    // VALIDATION FIX: Check for existing submission with atomic operation
     const existingSubmission = await db.collection("submissions").findOne({
       task: new ObjectId(taskId),
       worker: req.user._id,
@@ -184,13 +201,14 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "You have already submitted for this task",
+        existingStatus: existingSubmission.status,
       });
     }
 
     const newSubmission = {
       task: new ObjectId(taskId),
       worker: req.user._id,
-      submissionDetails,
+      submissionDetails: submissionDetails.trim(),
       status: "pending",
       feedback: "",
       rewardPaid: 0,
@@ -205,6 +223,7 @@ router.post("/", protect, restrictTo("Worker"), async (req, res) => {
       submission: { ...newSubmission, _id: result.insertedId },
     });
   } catch (error) {
+    console.error("Submission creation error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to create submission. Please try again.",
