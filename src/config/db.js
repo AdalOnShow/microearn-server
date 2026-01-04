@@ -5,6 +5,12 @@ let client = null;
 
 const connectDB = async () => {
   try {
+    // SECURITY FIX: Ensure MONGODB_URI is set
+    if (!process.env.MONGODB_URI) {
+      console.error("CRITICAL: MONGODB_URI environment variable is not set");
+      process.exit(1);
+    }
+
     client = new MongoClient(process.env.MONGODB_URI);
     await client.connect();
     db = client.db();

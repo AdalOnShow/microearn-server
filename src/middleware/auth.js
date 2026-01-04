@@ -18,6 +18,15 @@ const protect = async (req, res, next) => {
       });
     }
 
+    // SECURITY FIX: Ensure JWT_SECRET is set
+    if (!process.env.JWT_SECRET) {
+      console.error("CRITICAL: JWT_SECRET environment variable is not set");
+      return res.status(500).json({
+        success: false,
+        message: "Server configuration error",
+      });
+    }
+
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const db = getDb();
     const user = await db.collection("users").findOne({ 
@@ -56,8 +65,13 @@ const restrictTo = (...roles) => {
 
 // Generate JWT token
 const generateToken = (id) => {
+  // SECURITY FIX: Ensure JWT_SECRET is set
+  if (!process.env.JWT_SECRET) {
+    throw new Error("JWT_SECRET environment variable is not set");
+  }
+  
   return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN,
+    expiresIn: process.env.JWT_EXPIRES_IN || "7d",
   });
 };
 

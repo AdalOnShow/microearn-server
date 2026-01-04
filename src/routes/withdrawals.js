@@ -203,32 +203,71 @@ router.patch("/:id", protect, restrictTo("Admin"), async (req, res) => {
     }
 
     const db = getDb();
-    const withdrawal = await db.collection("withdrawals").findOne({ 
-      _id: new ObjectId(req.params.id) 
-    });
+    
+    // SECURITY FIX: Use atomic operation to prevent race conditions
+    const withdrawal = await db.collection("withdrawals").findOneAndUpdate(
+      { 
+        _id: new ObjectId(req.params.id),
+        status: "pending" // Only update if still pending
+      },
+      { 
+        $set: { 
+          status: "processing", // Lock the withdrawal
+          processedAt: new Date()
+        } 
+      },
+      { returnDocument: "after" }
+    );
 
     if (!withdrawal) {
       return res.status(404).json({
         success: false,
-        message: "Withdrawal not found",
+        message: "Withdrawal not found or already processed",
       });
     }
 
-    // Handle coin deduction based on status
-    if (status === "approved" && withdrawal.status === "pending") {
-      // Deduct coins when approved (not when initially requested)
-      await db.collection("users").updateOne(
-        { _id: withdrawal.user },
+    // SECURITY FIX: Prevent double approval - check if coins were already deducted
+    if (status === "approved") {
+      // Get fresh user data to check current balance
+      const user = await db.collection("users").findOne({ _id: withdrawal.user });
+      
+      if (!user) {
+        // Rollback the processing status
+        await db.collection("withdrawals").updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status: "pending" } }
+        );
+        return res.status(404).json({
+          success: false,
+          message: "User not found",
+        });
+      }
+
+      // SECURITY FIX: Atomic coin deduction with balance check
+      const coinDeductionResult = await db.collection("users").updateOne(
+        { 
+          _id: withdrawal.user,
+          coin: { $gte: withdrawal.amount } // Only deduct if sufficient balance
+        },
         { $inc: { coin: -withdrawal.amount } }
       );
-    } else if (status === "rejected" && withdrawal.status === "approved") {
-      // Refund coins if previously approved withdrawal is now rejected
-      await db.collection("users").updateOne(
-        { _id: withdrawal.user },
-        { $inc: { coin: withdrawal.amount } }
-      );
+
+      if (coinDeductionResult.modifiedCount === 0) {
+        // Rollback the processing status
+        await db.collection("withdrawals").updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { status: "pending" } }
+        );
+        return res.status(400).json({
+          success: false,
+          message: "Insufficient coins for withdrawal",
+          availableCoins: user.coin,
+          requestedCoins: withdrawal.amount,
+        });
+      }
     }
 
+    // Update withdrawal with final status
     const result = await db.collection("withdrawals").findOneAndUpdate(
       { _id: new ObjectId(req.params.id) },
       { 
@@ -246,9 +285,10 @@ router.patch("/:id", protect, restrictTo("Admin"), async (req, res) => {
       withdrawal: result,
     });
   } catch (error) {
+    console.error("Withdrawal processing error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Failed to process withdrawal. Please try again.",
     });
   }
 });

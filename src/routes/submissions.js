@@ -233,21 +233,25 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
 
     const db = getDb();
     
-    const submission = await db.collection("submissions").findOne({ 
-      _id: new ObjectId(req.params.id) 
-    });
+    // SECURITY FIX: Use atomic operation to prevent double approval
+    const submission = await db.collection("submissions").findOneAndUpdate(
+      { 
+        _id: new ObjectId(req.params.id),
+        status: "pending" // Only update if still pending
+      },
+      { 
+        $set: { 
+          status: "processing", // Lock the submission
+          reviewedAt: new Date()
+        } 
+      },
+      { returnDocument: "after" }
+    );
 
     if (!submission) {
       return res.status(404).json({
         success: false,
-        message: "Submission not found",
-      });
-    }
-
-    if (submission.status !== "pending") {
-      return res.status(400).json({
-        success: false,
-        message: `Submission has already been ${submission.status}. Cannot review again.`,
+        message: "Submission not found or already reviewed",
       });
     }
 
@@ -256,13 +260,24 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
     });
 
     if (!task) {
+      // Rollback the processing status
+      await db.collection("submissions").updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status: "pending" } }
+      );
       return res.status(404).json({
         success: false,
         message: "Associated task not found",
       });
     }
 
+    // SECURITY FIX: Validate ownership with proper authorization
     if (task.buyer.toString() !== req.user._id.toString() && req.user.role !== "Admin") {
+      // Rollback the processing status
+      await db.collection("submissions").updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status: "pending" } }
+      );
       return res.status(403).json({
         success: false,
         message: "Not authorized to review this submission.",
@@ -278,43 +293,55 @@ router.patch("/:id/review", protect, restrictTo("Buyer", "Admin"), async (req, r
     if (status === "approved") {
       updates.rewardPaid = task.reward;
       
-      await db.collection("users").updateOne(
-        { _id: submission.worker },
-        { $inc: { coin: task.reward } }
-      );
+      // SECURITY FIX: Atomic operations to prevent race conditions
+      // Update worker coins and task completion count atomically
+      const session = db.client.startSession();
+      
+      try {
+        await session.withTransaction(async () => {
+          // Award coins to worker
+          await db.collection("users").updateOne(
+            { _id: submission.worker },
+            { $inc: { coin: task.reward } },
+            { session }
+          );
 
-      await db.collection("tasks").updateOne(
-        { _id: task._id },
-        { $inc: { completedCount: 1 } }
-      );
+          // Increment task completion count
+          await db.collection("tasks").updateOne(
+            { _id: task._id },
+            { $inc: { completedCount: 1 } },
+            { session }
+          );
+
+          // Update submission status
+          await db.collection("submissions").updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: updates },
+            { session }
+          );
+        });
+      } finally {
+        await session.endSession();
+      }
     } else if (status === "rejected") {
-      await db.collection("tasks").updateOne(
-        { _id: task._id },
-        { $inc: { quantity: 1 } }
+      // For rejected submissions, just update the submission
+      await db.collection("submissions").updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: updates }
       );
     }
 
-    const result = await db.collection("submissions").findOneAndUpdate(
-      { 
-        _id: new ObjectId(req.params.id),
-        status: "pending"
-      },
-      { $set: updates },
-      { returnDocument: "after" }
-    );
-
-    if (!result) {
-      return res.status(400).json({
-        success: false,
-        message: "Submission was already reviewed by another process",
-      });
-    }
+    // Get the updated submission
+    const result = await db.collection("submissions").findOne({
+      _id: new ObjectId(req.params.id)
+    });
 
     res.json({
       success: true,
       submission: result,
     });
   } catch (error) {
+    console.error("Submission review error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to review submission. Please try again.",
