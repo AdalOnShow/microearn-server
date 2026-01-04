@@ -152,7 +152,7 @@ router.post("/login", async (req, res) => {
     const db = getDb();
     const user = await db.collection("users").findOne({ email: cleanEmail });
 
-    if (!user) {
+    if (!user || !user.password) {
       return res.status(401).json({
         success: false,
         message: "Invalid email or password",
@@ -164,14 +164,7 @@ router.post("/login", async (req, res) => {
         success: false,
         message: "Please login with Google",
       });
-    }
-
-    if (!user.password) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid email or password",
-      });
-    }
+    };
 
     const isMatch = await bcrypt.compare(password, user.password);
 
